@@ -1,6 +1,6 @@
 """myapp.py
 
-Usage:
+Usage::
 
    (window1)$ python myapp.py worker -l info
 
@@ -22,6 +22,7 @@ name using the fully qualified form::
     $ celery -A myapp:app worker -l info
 
 """
+from __future__ import absolute_import, unicode_literals
 from celery import Celery
 
 app = Celery(
@@ -35,6 +36,7 @@ app = Celery(
 @app.task
 def add(x, y):
     return x + y
+
 
 if __name__ == '__main__':
     app.start()

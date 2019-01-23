@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.backends.riak
-    ~~~~~~~~~~~~~~~~~~~~
+"""Riak result store backend."""
+from __future__ import absolute_import, unicode_literals
 
-    Riak result store backend.
+import sys
+import warnings
 
-"""
-from __future__ import absolute_import
+from kombu.utils.url import _parse_url
+
+from celery.exceptions import CeleryWarning, ImproperlyConfigured
+
+from .base import KeyValueStoreBackend
 
 try:
     import riak
@@ -15,27 +18,50 @@ try:
 except ImportError:  # pragma: no cover
     riak = RiakClient = last_written_resolver = None  # noqa
 
-from kombu.utils.url import _parse_url
-
-from celery.exceptions import ImproperlyConfigured
-from celery.utils.timeutils import maybe_timedelta
-
-from .base import KeyValueStoreBackend
+__all__ = ('RiakBackend',)
 
 E_BUCKET_NAME = """\
 Riak bucket names must be composed of ASCII characters only, not: {0!r}\
 """
 
+W_UNSUPPORTED_PYTHON_VERSION = """\
+Python {}.{} is unsupported by the client library \
+https://pypi.org/project/riak\
+""".format(sys.version_info.major, sys.version_info.minor)
 
-def is_ascii(s):
+
+if sys.version_info[0] == 3:
+    if sys.version_info.minor >= 7:
+        warnings.warn(CeleryWarning(W_UNSUPPORTED_PYTHON_VERSION))
+
+    def to_bytes(string):
+        return string.encode() if isinstance(string, str) else string
+
+    def str_decode(string, encoding):
+        return to_bytes(string).decode(encoding)
+
+else:
+
+    def str_decode(string, encoding):
+        return string.decode('ascii')
+
+
+def is_ascii(string):
     try:
-        s.decode('ascii')
+        str_decode(string, 'ascii')
     except UnicodeDecodeError:
         return False
     return True
 
 
 class RiakBackend(KeyValueStoreBackend):
+    """Riak result backend.
+
+    Raises:
+        celery.exceptions.ImproperlyConfigured:
+            if module :pypi:`riak` is not available.
+    """
+
     # TODO: allow using other protocols than protobuf ?
     #: default protocol used to connect to Riak, might be `http` or `pbc`
     protocol = 'pbc'
@@ -49,32 +75,25 @@ class RiakBackend(KeyValueStoreBackend):
     #: default Riak server port (8087)
     port = 8087
 
-    # supports_autoexpire = False
+    _bucket = None
 
     def __init__(self, host=None, port=None, bucket_name=None, protocol=None,
                  url=None, *args, **kwargs):
-        """Initialize Riak backend instance.
-
-        :raises celery.exceptions.ImproperlyConfigured: if
-            module :mod:`riak` is not available.
-        """
         super(RiakBackend, self).__init__(*args, **kwargs)
-
-        self.expires = kwargs.get('expires') or maybe_timedelta(
-            self.app.conf.CELERY_TASK_RESULT_EXPIRES)
+        self.url = url
 
         if not riak:
             raise ImproperlyConfigured(
                 'You need to install the riak library to use the '
                 'Riak backend.')
 
-        uhost = uport = uname = upass = ubucket = None
+        uhost = uport = upass = ubucket = None
         if url:
-            uprot, uhost, uport, uname, upass, ubucket, _ = _parse_url(url)
+            _, uhost, uport, _, upass, ubucket, _ = _parse_url(url)
             if ubucket:
                 ubucket = ubucket.strip('/')
 
-        config = self.app.conf.get('CELERY_RIAK_BACKEND_SETTINGS', None)
+        config = self.app.conf.get('riak_backend_settings', None)
         if config is not None:
             if not isinstance(config, dict):
                 raise ImproperlyConfigured(
@@ -105,8 +124,8 @@ class RiakBackend(KeyValueStoreBackend):
     def _get_bucket(self):
         """Connect to our bucket."""
         if (
-            self._client is None or not self._client.is_alive()
-            or not self._bucket
+                self._client is None or not self._client.is_alive() or
+                not self._bucket
         ):
             self._bucket = self.client.bucket(self.bucket_name)
         return self._bucket

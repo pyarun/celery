@@ -1,40 +1,38 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.beat
-    ~~~~~~~~~~~
+"""The periodic task scheduler."""
+from __future__ import absolute_import, unicode_literals
 
-    The periodic task scheduler.
-
-"""
-from __future__ import absolute_import
-
+import copy
 import errno
 import heapq
 import os
-import time
 import shelve
 import sys
+import time
 import traceback
-
+from calendar import timegm
 from collections import namedtuple
+from functools import total_ordering
 from threading import Event, Thread
 
-from billiard import Process, ensure_multiprocessing
+from billiard import ensure_multiprocessing
 from billiard.common import reset_signals
-from kombu.utils import cached_property, reprcall
-from kombu.utils.functional import maybe_evaluate
+from billiard.context import Process
+from kombu.utils.functional import maybe_evaluate, reprcall
+from kombu.utils.objects import cached_property
 
-from . import __version__
-from . import platforms
-from . import signals
-from .five import items, reraise, values, monotonic
-from .schedules import maybe_schedule, crontab
-from .utils.imports import instantiate
-from .utils.timeutils import humanize_seconds
+from . import __version__, platforms, signals
+from .five import (items, monotonic, python_2_unicode_compatible, reraise,
+                   values)
+from .schedules import crontab, maybe_schedule
+from .utils.imports import load_extension_class_names, symbol_by_name
 from .utils.log import get_logger, iter_open_logger_fds
+from .utils.time import humanize_seconds, maybe_make_aware
 
-__all__ = ['SchedulingError', 'ScheduleEntry', 'Scheduler',
-           'PersistentScheduler', 'Service', 'EmbeddedService']
+__all__ = (
+    'SchedulingError', 'ScheduleEntry', 'Scheduler',
+    'PersistentScheduler', 'Service', 'EmbeddedService',
+)
 
 event_t = namedtuple('event_t', ('time', 'priority', 'entry'))
 
@@ -46,27 +44,29 @@ DEFAULT_MAX_INTERVAL = 300  # 5 minutes
 
 
 class SchedulingError(Exception):
-    """An error occured while scheduling a task."""
+    """An error occurred while scheduling a task."""
 
 
+@total_ordering
+@python_2_unicode_compatible
 class ScheduleEntry(object):
     """An entry in the scheduler.
 
-    :keyword name: see :attr:`name`.
-    :keyword schedule: see :attr:`schedule`.
-    :keyword args: see :attr:`args`.
-    :keyword kwargs: see :attr:`kwargs`.
-    :keyword options: see :attr:`options`.
-    :keyword last_run_at: see :attr:`last_run_at`.
-    :keyword total_run_count: see :attr:`total_run_count`.
-    :keyword relative: Is the time relative to when the server starts?
-
+    Arguments:
+        name (str): see :attr:`name`.
+        schedule (~celery.schedules.schedule): see :attr:`schedule`.
+        args (Tuple): see :attr:`args`.
+        kwargs (Dict): see :attr:`kwargs`.
+        options (Dict): see :attr:`options`.
+        last_run_at (~datetime.datetime): see :attr:`last_run_at`.
+        total_run_count (int): see :attr:`total_run_count`.
+        relative (bool): Is the time relative to when the server starts?
     """
 
     #: The task name
     name = None
 
-    #: The schedule (run_every/crontab)
+    #: The schedule (:class:`~celery.schedules.schedule`)
     schedule = None
 
     #: Positional arguments to apply.
@@ -85,27 +85,27 @@ class ScheduleEntry(object):
     total_run_count = 0
 
     def __init__(self, name=None, task=None, last_run_at=None,
-                 total_run_count=None, schedule=None, args=(), kwargs={},
-                 options={}, relative=False, app=None):
+                 total_run_count=None, schedule=None, args=(), kwargs=None,
+                 options=None, relative=False, app=None):
         self.app = app
         self.name = name
         self.task = task
         self.args = args
-        self.kwargs = kwargs
-        self.options = options
+        self.kwargs = kwargs if kwargs else {}
+        self.options = options if options else {}
         self.schedule = maybe_schedule(schedule, relative, app=self.app)
-        self.last_run_at = last_run_at or self._default_now()
+        self.last_run_at = last_run_at or self.default_now()
         self.total_run_count = total_run_count or 0
 
-    def _default_now(self):
+    def default_now(self):
         return self.schedule.now() if self.schedule else self.app.now()
+    _default_now = default_now  # compat
 
     def _next_instance(self, last_run_at=None):
-        """Return a new instance of the same class, but with
-        its date and count fields updated."""
+        """Return new instance, with date and count fields updated."""
         return self.__class__(**dict(
             self,
-            last_run_at=last_run_at or self._default_now(),
+            last_run_at=last_run_at or self.default_now(),
             total_run_count=self.total_run_count + 1,
         ))
     __next__ = next = _next_instance  # for 2to3
@@ -119,13 +119,14 @@ class ScheduleEntry(object):
     def update(self, other):
         """Update values from another entry.
 
-        Does only update "editable" fields (task, schedule, args, kwargs,
-        options).
-
+        Will only update "editable" fields:
+            ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
         """
-        self.__dict__.update({'task': other.task, 'schedule': other.schedule,
-                              'args': other.args, 'kwargs': other.kwargs,
-                              'options': other.options})
+        self.__dict__.update({
+            'task': other.task, 'schedule': other.schedule,
+            'args': other.args, 'kwargs': other.kwargs,
+            'options': other.options,
+        })
 
     def is_due(self):
         """See :meth:`~celery.schedule.schedule.is_due`."""
@@ -135,10 +136,44 @@ class ScheduleEntry(object):
         return iter(items(vars(self)))
 
     def __repr__(self):
-        return '<Entry: {0.name} {call} {0.schedule}'.format(
+        return '<{name}: {0.name} {call} {0.schedule}'.format(
             self,
             call=reprcall(self.task, self.args or (), self.kwargs or {}),
+            name=type(self).__name__,
         )
+
+    def __lt__(self, other):
+        if isinstance(other, ScheduleEntry):
+            # How the object is ordered doesn't really matter, as
+            # in the scheduler heap, the order is decided by the
+            # preceding members of the tuple ``(time, priority, entry)``.
+            #
+            # If all that's left to order on is the entry then it can
+            # just as well be random.
+            return id(self) < id(other)
+        return NotImplemented
+
+    def editable_fields_equal(self, other):
+        for attr in ('task', 'args', 'kwargs', 'options', 'schedule'):
+            if getattr(self, attr) != getattr(other, attr):
+                return False
+        return True
+
+    def __eq__(self, other):
+        """Test schedule entries equality.
+
+        Will only compare "editable" fields:
+        ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
+        """
+        return self.editable_fields_equal(other)
+
+    def __ne__(self, other):
+        """Test schedule entries inequality.
+
+        Will only compare "editable" fields:
+        ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
+        """
+        return not self == other
 
 
 class Scheduler(object):
@@ -146,14 +181,15 @@ class Scheduler(object):
 
     The :program:`celery beat` program may instantiate this class
     multiple times for introspection purposes, but then with the
-    ``lazy`` argument set.  It is important for subclasses to
+    ``lazy`` argument set.  It's important for subclasses to
     be idempotent when this argument is set.
 
-    :keyword schedule: see :attr:`schedule`.
-    :keyword max_interval: see :attr:`max_interval`.
-    :keyword lazy: Do not set up the schedule.
-
+    Arguments:
+        schedule (~celery.schedules.schedule): see :attr:`schedule`.
+        max_interval (int): see :attr:`max_interval`.
+        lazy (bool): Don't set up the schedule.
     """
+
     Entry = ScheduleEntry
 
     #: The schedule dict/shelve.
@@ -177,20 +213,21 @@ class Scheduler(object):
                  Producer=None, lazy=False, sync_every_tasks=None, **kwargs):
         self.app = app
         self.data = maybe_evaluate({} if schedule is None else schedule)
-        self.max_interval = (max_interval
-                             or app.conf.CELERYBEAT_MAX_LOOP_INTERVAL
-                             or self.max_interval)
+        self.max_interval = (max_interval or
+                             app.conf.beat_max_loop_interval or
+                             self.max_interval)
         self.Producer = Producer or app.amqp.Producer
         self._heap = None
+        self.old_schedulers = None
         self.sync_every_tasks = (
-            app.conf.CELERYBEAT_SYNC_EVERY if sync_every_tasks is None
+            app.conf.beat_sync_every if sync_every_tasks is None
             else sync_every_tasks)
         if not lazy:
             self.setup_schedule()
 
     def install_default_entries(self, data):
         entries = {}
-        if self.app.conf.CELERY_TASK_RESULT_EXPIRES and \
+        if self.app.conf.result_expires and \
                 not self.app.backend.supports_autoexpire:
             if 'celery.backend_cleanup' not in data:
                 entries['celery.backend_cleanup'] = {
@@ -203,7 +240,7 @@ class Scheduler(object):
         info('Scheduler: Sending due task %s (%s)', entry.name, entry.task)
         try:
             result = self.apply_async(entry, producer=producer, advance=False)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             error('Message Error: %s\n%s',
                   exc, traceback.format_stack(), exc_info=True)
         else:
@@ -217,27 +254,51 @@ class Scheduler(object):
     def is_due(self, entry):
         return entry.is_due()
 
-    def tick(self, event_t=event_t, min=min,
-             heappop=heapq.heappop, heappush=heapq.heappush,
-             heapify=heapq.heapify, mktime=time.mktime):
-        """Run a tick, that is one iteration of the scheduler.
+    def _when(self, entry, next_time_to_run, mktime=timegm):
+        """Return a utc timestamp, make sure heapq in currect order."""
+        adjust = self.adjust
+
+        as_now = maybe_make_aware(entry.default_now())
+
+        return (mktime(as_now.utctimetuple()) +
+                as_now.microsecond / 1e6 +
+                (adjust(next_time_to_run) or 0))
+
+    def populate_heap(self, event_t=event_t, heapify=heapq.heapify):
+        """Populate the heap with the data contained in the schedule."""
+        priority = 5
+        self._heap = []
+        for entry in values(self.schedule):
+            is_due, next_call_delay = entry.is_due()
+            self._heap.append(event_t(
+                self._when(
+                    entry,
+                    0 if is_due else next_call_delay
+                ) or 0,
+                priority, entry
+            ))
+        heapify(self._heap)
+
+    # pylint disable=redefined-outer-name
+    def tick(self, event_t=event_t, min=min, heappop=heapq.heappop,
+             heappush=heapq.heappush):
+        """Run a tick - one iteration of the scheduler.
 
         Executes one due task per call.
 
-        Returns preferred delay in seconds for next call.
+        Returns:
+            float: preferred delay in seconds for next call.
         """
-
-        def _when(entry, next_time_to_run):
-            return (mktime(entry.schedule.now().timetuple())
-                    + (adjust(next_time_to_run) or 0))
-
         adjust = self.adjust
         max_interval = self.max_interval
+
+        if (self._heap is None or
+                not self.schedules_equal(self.old_schedulers, self.schedule)):
+            self.old_schedulers = copy.copy(self.schedule)
+            self.populate_heap()
+
         H = self._heap
-        if H is None:
-            H = self._heap = [event_t(_when(e, e.is_due()[1]) or 0, 5, e)
-                              for e in values(self.schedule)]
-            heapify(H)
+
         if not H:
             return max_interval
 
@@ -249,7 +310,7 @@ class Scheduler(object):
             if verify is event:
                 next_entry = self.reserve(entry)
                 self.apply_entry(entry, producer=self.producer)
-                heappush(H, event_t(_when(next_entry, next_time_to_run),
+                heappush(H, event_t(self._when(next_entry, next_time_to_run),
                                     event[1], next_entry))
                 return 0
             else:
@@ -257,12 +318,27 @@ class Scheduler(object):
                 return min(verify[0], max_interval)
         return min(adjust(next_time_to_run) or max_interval, max_interval)
 
+    def schedules_equal(self, old_schedules, new_schedules):
+        if old_schedules is new_schedules is None:
+            return True
+        if old_schedules is None or new_schedules is None:
+            return False
+        if set(old_schedules.keys()) != set(new_schedules.keys()):
+            return False
+        for name, old_entry in old_schedules.items():
+            new_entry = new_schedules.get(name)
+            if not new_entry:
+                return False
+            if new_entry != old_entry:
+                return False
+        return True
+
     def should_sync(self):
         return (
             (not self._last_sync or
-               (monotonic() - self._last_sync) > self.sync_every) or
+             (monotonic() - self._last_sync) > self.sync_every) or
             (self.sync_every_tasks and
-                self._tasks_since_sync >= self.sync_every_tasks)
+             self._tasks_since_sync >= self.sync_every_tasks)
         )
 
     def reserve(self, entry):
@@ -270,7 +346,7 @@ class Scheduler(object):
         return new_entry
 
     def apply_async(self, entry, producer=None, advance=True, **kwargs):
-        # Update timestamps and run counts before we actually execute,
+        # Update time-stamps and run counts before we actually execute,
         # so we have that done if an exception is raised (doesn't schedule
         # forever.)
         entry = self.reserve(entry) if advance else entry
@@ -285,7 +361,7 @@ class Scheduler(object):
                 return self.send_task(entry.task, entry.args, entry.kwargs,
                                       producer=producer,
                                       **entry.options)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             reraise(SchedulingError, SchedulingError(
                 "Couldn't apply scheduled task {0.name}: {exc}".format(
                     entry, exc=exc)), sys.exc_info()[2])
@@ -355,7 +431,7 @@ class Scheduler(object):
                   'Trying again in %s seconds...', exc, interval)
 
         return self.connection.ensure_connection(
-            _error_handler, self.app.conf.BROKER_CONNECTION_MAX_RETRIES
+            _error_handler, self.app.conf.broker_connection_max_retries
         )
 
     def get_schedule(self):
@@ -367,11 +443,11 @@ class Scheduler(object):
 
     @cached_property
     def connection(self):
-        return self.app.connection()
+        return self.app.connection_for_write()
 
     @cached_property
     def producer(self):
-        return self.Producer(self._ensure_connected())
+        return self.Producer(self._ensure_connected(), auto_declare=False)
 
     @property
     def info(self):
@@ -379,6 +455,8 @@ class Scheduler(object):
 
 
 class PersistentScheduler(Scheduler):
+    """Scheduler backed by :mod:`shelve` database."""
+
     persistence = shelve
     known_suffixes = ('', '.db', '.dat', '.bak', '.dir')
 
@@ -393,58 +471,81 @@ class PersistentScheduler(Scheduler):
             with platforms.ignore_errno(errno.ENOENT):
                 os.remove(self.schedule_filename + suffix)
 
+    def _open_schedule(self):
+        return self.persistence.open(self.schedule_filename, writeback=True)
+
+    def _destroy_open_corrupted_schedule(self, exc):
+        error('Removing corrupted schedule file %r: %r',
+              self.schedule_filename, exc, exc_info=True)
+        self._remove_db()
+        return self._open_schedule()
+
     def setup_schedule(self):
         try:
-            self._store = self.persistence.open(self.schedule_filename,
-                                                writeback=True)
-        except Exception as exc:
-            error('Removing corrupted schedule file %r: %r',
-                  self.schedule_filename, exc, exc_info=True)
-            self._remove_db()
-            self._store = self.persistence.open(self.schedule_filename,
-                                                writeback=True)
-        else:
-            try:
-                self._store['entries']
-            except KeyError:
-                # new schedule db
-                self._store['entries'] = {}
-            else:
-                if '__version__' not in self._store:
-                    warning('DB Reset: Account for new __version__ field')
-                    self._store.clear()   # remove schedule at 2.2.2 upgrade.
-                elif 'tz' not in self._store:
-                    warning('DB Reset: Account for new tz field')
-                    self._store.clear()   # remove schedule at 3.0.8 upgrade
-                elif 'utc_enabled' not in self._store:
-                    warning('DB Reset: Account for new utc_enabled field')
-                    self._store.clear()   # remove schedule at 3.0.9 upgrade
+            self._store = self._open_schedule()
+            # In some cases there may be different errors from a storage
+            # backend for corrupted files.  Example - DBPageNotFoundError
+            # exception from bsddb.  In such case the file will be
+            # successfully opened but the error will be raised on first key
+            # retrieving.
+            self._store.keys()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._store = self._destroy_open_corrupted_schedule(exc)
 
-        tz = self.app.conf.CELERY_TIMEZONE
-        stored_tz = self._store.get('tz')
+        self._create_schedule()
+
+        tz = self.app.conf.timezone
+        stored_tz = self._store.get(str('tz'))
         if stored_tz is not None and stored_tz != tz:
             warning('Reset: Timezone changed from %r to %r', stored_tz, tz)
             self._store.clear()   # Timezone changed, reset db!
-        utc = self.app.conf.CELERY_ENABLE_UTC
-        stored_utc = self._store.get('utc_enabled')
+        utc = self.app.conf.enable_utc
+        stored_utc = self._store.get(str('utc_enabled'))
         if stored_utc is not None and stored_utc != utc:
             choices = {True: 'enabled', False: 'disabled'}
             warning('Reset: UTC changed from %s to %s',
                     choices[stored_utc], choices[utc])
             self._store.clear()   # UTC setting changed, reset db!
-        entries = self._store.setdefault('entries', {})
-        self.merge_inplace(self.app.conf.CELERYBEAT_SCHEDULE)
+        entries = self._store.setdefault(str('entries'), {})
+        self.merge_inplace(self.app.conf.beat_schedule)
         self.install_default_entries(self.schedule)
-        self._store.update(__version__=__version__, tz=tz, utc_enabled=utc)
+        self._store.update({
+            str('__version__'): __version__,
+            str('tz'): tz,
+            str('utc_enabled'): utc,
+        })
         self.sync()
         debug('Current schedule:\n' + '\n'.join(
             repr(entry) for entry in values(entries)))
 
+    def _create_schedule(self):
+        for _ in (1, 2):
+            try:
+                self._store[str('entries')]
+            except KeyError:
+                # new schedule db
+                try:
+                    self._store[str('entries')] = {}
+                except KeyError as exc:
+                    self._store = self._destroy_open_corrupted_schedule(exc)
+                    continue
+            else:
+                if str('__version__') not in self._store:
+                    warning('DB Reset: Account for new __version__ field')
+                    self._store.clear()   # remove schedule at 2.2.2 upgrade.
+                elif str('tz') not in self._store:
+                    warning('DB Reset: Account for new tz field')
+                    self._store.clear()   # remove schedule at 3.0.8 upgrade
+                elif str('utc_enabled') not in self._store:
+                    warning('DB Reset: Account for new utc_enabled field')
+                    self._store.clear()   # remove schedule at 3.0.9 upgrade
+            break
+
     def get_schedule(self):
-        return self._store['entries']
+        return self._store[str('entries')]
 
     def set_schedule(self, schedule):
-        self._store['entries'] = schedule
+        self._store[str('entries')] = schedule
     schedule = property(get_schedule, set_schedule)
 
     def sync(self):
@@ -461,16 +562,18 @@ class PersistentScheduler(Scheduler):
 
 
 class Service(object):
+    """Celery periodic task service."""
+
     scheduler_cls = PersistentScheduler
 
     def __init__(self, app, max_interval=None, schedule_filename=None,
                  scheduler_cls=None):
         self.app = app
-        self.max_interval = (max_interval
-                             or app.conf.CELERYBEAT_MAX_LOOP_INTERVAL)
+        self.max_interval = (max_interval or
+                             app.conf.beat_max_loop_interval)
         self.scheduler_cls = scheduler_cls or self.scheduler_cls
         self.schedule_filename = (
-            schedule_filename or app.conf.CELERYBEAT_SCHEDULE_FILENAME)
+            schedule_filename or app.conf.beat_schedule_filename)
 
         self._is_shutdown = Event()
         self._is_stopped = Event()
@@ -496,6 +599,8 @@ class Service(object):
                     debug('beat: Waking up %s.',
                           humanize_seconds(interval, prefix='in '))
                     time.sleep(interval)
+                    if self.scheduler.should_sync():
+                        self.scheduler._do_sync()
         except (KeyboardInterrupt, SystemExit):
             self._is_shutdown.set()
         finally:
@@ -510,14 +615,17 @@ class Service(object):
         self._is_shutdown.set()
         wait and self._is_stopped.wait()  # block until shutdown done.
 
-    def get_scheduler(self, lazy=False):
+    def get_scheduler(self, lazy=False,
+                      extension_namespace='celery.beat_schedulers'):
         filename = self.schedule_filename
-        scheduler = instantiate(self.scheduler_cls,
-                                app=self.app,
-                                schedule_filename=filename,
-                                max_interval=self.max_interval,
-                                lazy=lazy)
-        return scheduler
+        aliases = dict(
+            load_extension_class_names(extension_namespace) or {})
+        return symbol_by_name(self.scheduler_cls, aliases=aliases)(
+            app=self.app,
+            schedule_filename=filename,
+            max_interval=self.max_interval,
+            lazy=lazy,
+        )
 
     @cached_property
     def scheduler(self):
@@ -527,13 +635,15 @@ class Service(object):
 class _Threaded(Thread):
     """Embedded task scheduler using threading."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, app, **kwargs):
         super(_Threaded, self).__init__()
-        self.service = Service(*args, **kwargs)
+        self.app = app
+        self.service = Service(app, **kwargs)
         self.daemon = True
         self.name = 'Beat'
 
     def run(self):
+        self.app.set_current()
         self.service.start()
 
     def stop(self):
@@ -547,9 +657,10 @@ except NotImplementedError:     # pragma: no cover
 else:
     class _Process(Process):    # noqa
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self, app, **kwargs):
             super(_Process, self).__init__()
-            self.service = Service(*args, **kwargs)
+            self.app = app
+            self.service = Service(app, **kwargs)
             self.name = 'Beat'
 
         def run(self):
@@ -557,6 +668,8 @@ else:
             platforms.close_open_fds([
                 sys.__stdin__, sys.__stdout__, sys.__stderr__,
             ] + list(iter_open_logger_fds()))
+            self.app.set_default()
+            self.app.set_current()
             self.service.start(embedded_process=True)
 
         def stop(self):
@@ -564,16 +677,15 @@ else:
             self.terminate()
 
 
-def EmbeddedService(*args, **kwargs):
+def EmbeddedService(app, max_interval=None, **kwargs):
     """Return embedded clock service.
 
-    :keyword thread: Run threaded instead of as a separate process.
-        Uses :mod:`multiprocessing` by default, if available.
-
+    Arguments:
+        thread (bool): Run threaded instead of as a separate process.
+            Uses :mod:`multiprocessing` by default, if available.
     """
     if kwargs.pop('thread', False) or _Process is None:
         # Need short max interval to be able to stop thread
         # in reasonable time.
-        kwargs.setdefault('max_interval', 1)
-        return _Threaded(*args, **kwargs)
-    return _Process(*args, **kwargs)
+        return _Threaded(app, max_interval=1, **kwargs)
+    return _Process(app, max_interval=max_interval, **kwargs)

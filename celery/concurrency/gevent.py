@@ -1,36 +1,32 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.concurrency.gevent
-    ~~~~~~~~~~~~~~~~~~~~~~~~~
+"""Gevent execution pool."""
+from __future__ import absolute_import, unicode_literals
 
-    gevent pool implementation.
+from kombu.asynchronous import timer as _timer
+from kombu.five import monotonic
 
-"""
-from __future__ import absolute_import
-
-from time import time
+from . import base
 
 try:
     from gevent import Timeout
 except ImportError:  # pragma: no cover
     Timeout = None  # noqa
 
-from kombu.async import timer as _timer
+__all__ = ('TaskPool',)
 
-from .base import apply_target, BasePool
-
-__all__ = ['TaskPool']
+# pylint: disable=redefined-outer-name
+# We cache globals and attribute lookups, so disable this warning.
 
 
 def apply_timeout(target, args=(), kwargs={}, callback=None,
                   accept_callback=None, pid=None, timeout=None,
                   timeout_callback=None, Timeout=Timeout,
-                  apply_target=apply_target, **rest):
+                  apply_target=base.apply_target, **rest):
     try:
         with Timeout(timeout):
             return apply_target(target, args, kwargs, callback,
                                 accept_callback, pid,
-                                propagate=(Timeout, ), **rest)
+                                propagate=(Timeout,), **rest)
     except Timeout:
         return timeout_callback(False, timeout)
 
@@ -38,7 +34,7 @@ def apply_timeout(target, args=(), kwargs={}, callback=None,
 class Timer(_timer.Timer):
 
     def __init__(self, *args, **kwargs):
-        from gevent.greenlet import Greenlet, GreenletExit
+        from gevent import Greenlet, GreenletExit
 
         class _Greenlet(Greenlet):
             cancel = Greenlet.kill
@@ -48,15 +44,15 @@ class Timer(_timer.Timer):
         super(Timer, self).__init__(*args, **kwargs)
         self._queue = set()
 
-    def _enter(self, eta, priority, entry):
-        secs = max(eta - time(), 0)
+    def _enter(self, eta, priority, entry, **kwargs):
+        secs = max(eta - monotonic(), 0)
         g = self._Greenlet.spawn_later(secs, entry)
         self._queue.add(g)
         g.link(self._entry_exit)
         g.entry = entry
         g.eta = eta
         g.priority = priority
-        g.cancelled = False
+        g.canceled = False
         return g
 
     def _entry_exit(self, g):
@@ -78,12 +74,16 @@ class Timer(_timer.Timer):
         return self._queue
 
 
-class TaskPool(BasePool):
+class TaskPool(base.BasePool):
+    """GEvent Pool."""
+
     Timer = Timer
 
     signal_safe = False
     is_green = True
     task_join_will_block = False
+    _pool = None
+    _quick_put = None
 
     def __init__(self, *args, **kwargs):
         from gevent import spawn_raw
@@ -103,7 +103,7 @@ class TaskPool(BasePool):
 
     def on_apply(self, target, args=None, kwargs=None, callback=None,
                  accept_callback=None, timeout=None,
-                 timeout_callback=None, **_):
+                 timeout_callback=None, apply_target=base.apply_target, **_):
         timeout = self.timeout if timeout is None else timeout
         return self._quick_put(apply_timeout if timeout else apply_target,
                                target, args, kwargs, callback, accept_callback,
